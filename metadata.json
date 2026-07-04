@@ -1,0 +1,8 @@
+{
+  "name": "BDS Navigator",
+  "description": "A professional real estate market dashboard for investors focused on transparency and data-driven insights in Vietnam and Germany.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": []
+}
