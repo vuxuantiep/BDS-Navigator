@@ -204,6 +204,7 @@ export default function App() {
   const markersLayerRef = useRef<any | null>(null);
   const projectMarkerRef = useRef<L.Marker | null>(null);
   const newsMarkerRef = useRef<L.Marker | null>(null);
+  const historicalCacheRef = useRef<Record<string, number[]>>({});
 
   // Audio Context
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -309,10 +310,30 @@ export default function App() {
   const [selectedNews, setSelectedNews] = useState<NewsArticle | null>(null);
 
   // Price Alert / Watched properties state
-  const [watchedProperties, setWatchedProperties] = useState<string[]>(() => {
+  interface WatchedProperty {
+    id: string;
+    savedPrice: number;
+  }
+
+  const [watchedProperties, setWatchedProperties] = useState<WatchedProperty[]>(() => {
     try {
-      const saved = localStorage.getItem('watched-properties');
-      return saved ? JSON.parse(saved) : [];
+      const saved = localStorage.getItem('watched-properties-v2');
+      if (saved) {
+        return JSON.parse(saved);
+      }
+      const oldSaved = localStorage.getItem('watched-properties');
+      if (oldSaved) {
+        const parsed = JSON.parse(oldSaved);
+        if (Array.isArray(parsed)) {
+          return parsed.map((item: any) => {
+            if (typeof item === 'string') {
+              return { id: item, savedPrice: 0 };
+            }
+            return item;
+          });
+        }
+      }
+      return [];
     } catch {
       return [];
     }
@@ -331,6 +352,15 @@ export default function App() {
     shophouse: { price: 0, rent: 0, trend: 'stable' as 'up' | 'down' | 'stable' },
     occupancy: 81.5
   });
+
+  // Periodic state for live price fluctuation tracking
+  const [fluctuationTick, setFluctuationTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setFluctuationTick(t => t + 1);
+    }, 6000);
+    return () => clearInterval(interval);
+  }, []);
 
   const t = TRANSLATIONS[lang];
   const currentStats = CITY_STATS[city] || (market === 'VN' ? CITY_STATS["Hà Nội"] : CITY_STATS["Berlin"]);
@@ -366,11 +396,19 @@ export default function App() {
       const btn = target.closest('.watch-prop-btn');
       if (btn) {
         const propId = btn.getAttribute('data-prop-id');
+        const currentPriceVal = parseFloat(btn.getAttribute('data-current-price') || '0');
         if (propId) {
           setWatchedProperties(prev => {
-            const isCurrentlyWatched = prev.includes(propId);
-            const next = isCurrentlyWatched ? prev.filter(id => id !== propId) : [...prev, propId];
-            localStorage.setItem('watched-properties', JSON.stringify(next));
+            const isCurrentlyWatched = prev.some(p => p.id === propId);
+            let next;
+            if (isCurrentlyWatched) {
+              next = prev.filter(p => p.id !== propId);
+            } else {
+              next = [...prev, { id: propId, savedPrice: currentPriceVal }];
+            }
+            
+            localStorage.setItem('watched-properties-v2', JSON.stringify(next));
+            localStorage.setItem('watched-properties', JSON.stringify(next.map(p => p.id)));
             
             const btnEl = btn as HTMLButtonElement;
             const updatedIsWatched = !isCurrentlyWatched;
@@ -390,6 +428,157 @@ export default function App() {
     document.addEventListener('click', handlePopupClick);
     return () => document.removeEventListener('click', handlePopupClick);
   }, [lang]);
+
+  // --- SPARKLINE & HISTORICAL PRICE TRENDS ---
+  const fetchTrendFromAI = async (district: string, city: string, market: string, currentPriceVal: number, propId: string): Promise<number[]> => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const prompt = `Analyze historical market pricing in ${district}, ${city} (${market}).
+      Provide a realistic, smooth 12-month historical price trend (monthly values) ending with exactly the current price of ${currentPriceVal}.
+      
+      Return a JSON object containing a 'trend' array of exactly 12 numbers.
+      The last value (index 11) must be exactly ${currentPriceVal}.
+      Output valid JSON only in this format:
+      {
+        "trend": [val1, val2, val3, val4, val5, val6, val7, val8, val9, val10, val11, val12]
+      }`;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json"
+        }
+      });
+
+      const rawText = response.text || "{}";
+      const cleanedText = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+      const result = JSON.parse(cleanedText);
+      if (Array.isArray(result.trend) && result.trend.length === 12) {
+        return result.trend.map((v: any) => Number(v));
+      }
+    } catch (e) {
+      console.warn("AI sparkline trend generation failed, using robust fallback", e);
+    }
+    return generateFallbackTrend(propId, currentPriceVal);
+  };
+
+  const generateFallbackTrend = (propId: string, currentPriceVal: number): number[] => {
+    const rng = seededRandom(propId);
+    const trend: number[] = [];
+    const direction = rng() > 0.3 ? 1 : -1;
+    let current = currentPriceVal * (1.0 - (direction * (0.05 + rng() * 0.1)));
+    
+    for (let m = 0; m < 11; m++) {
+      trend.push(current);
+      const progress = m / 11;
+      const stepTarget = currentPriceVal * (0.9 + progress * 0.1);
+      current = current * (0.98 + rng() * 0.04);
+      current = current * 0.6 + stepTarget * 0.4;
+    }
+    trend.push(currentPriceVal);
+    return trend;
+  };
+
+  const renderSparkline = (container: HTMLElement, trend: number[], currentPriceVal: number, market: string, lang: Language) => {
+    const min = Math.min(...trend);
+    const max = Math.max(...trend);
+    const startVal = trend[0];
+    const endVal = trend[11];
+    const netChange = ((endVal - startVal) / (startVal || 1)) * 100;
+    
+    const trendColor = netChange > 0 ? '#10b981' : (netChange < 0 ? '#ef4444' : '#3b82f6');
+    const gradientId = `spark-grad-${Math.random().toString(36).substring(2, 7)}`;
+    
+    const width = 140;
+    const height = 32;
+    const paddingY = 4;
+    const range = max - min || 1;
+    
+    const points = trend.map((val, i) => {
+      const x = (i / 11) * width;
+      const y = height - paddingY - ((val - min) / range) * (height - 2 * paddingY);
+      return { x, y };
+    });
+    
+    const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+    const areaPath = `${linePath} L ${width} ${height} L 0 ${height} Z`;
+    const lastPoint = points[11];
+    
+    const formatCompact = (val: number) => {
+      if (market === 'VN') {
+        return `${val.toFixed(2)}B`;
+      } else {
+        return val > 100000 ? `${(val/1000).toFixed(0)}k` : `${val.toFixed(0)}`;
+      }
+    };
+
+    const pctString = `${netChange >= 0 ? '+' : ''}${netChange.toFixed(1)}%`;
+    const pctClass = netChange > 0 ? 'text-emerald-500' : (netChange < 0 ? 'text-rose-500' : 'text-blue-500');
+
+    container.innerHTML = `
+      <div class="relative w-full h-full flex flex-col justify-between p-1">
+        <svg class="absolute inset-0 w-full h-full" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="${trendColor}" stop-opacity="0.25"/>
+              <stop offset="100%" stop-color="${trendColor}" stop-opacity="0.00"/>
+            </linearGradient>
+          </defs>
+          <path d="${areaPath}" fill="url(#${gradientId})" />
+          <path d="${linePath}" fill="none" stroke="${trendColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+          <circle cx="${lastPoint.x.toFixed(1)}" cy="${lastPoint.y.toFixed(1)}" r="2.5" fill="${trendColor}" stroke="white" stroke-width="1" />
+        </svg>
+        
+        <div class="relative z-10 flex justify-between items-center w-full px-1 text-[8px] font-bold h-full">
+           <span class="text-slate-400 bg-white/70 px-1 py-0.2 rounded-sm shadow-sm">12m ago: ${formatCompact(startVal)}</span>
+           <span class="${pctClass} bg-white/70 px-1 py-0.2 rounded-sm shadow-sm">${pctString}</span>
+        </div>
+      </div>
+    `;
+  };
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    
+    const handlePopupOpen = async (e: any) => {
+      const popup = e.popup;
+      const popupElem = popup.getElement();
+      if (!popupElem) return;
+      
+      const container = popupElem.querySelector('.sparkline-container') as HTMLElement | null;
+      if (!container) return;
+      
+      const propId = container.getAttribute('data-prop-id');
+      const dist = container.getAttribute('data-district') || '';
+      const cty = container.getAttribute('data-city') || '';
+      const mkt = container.getAttribute('data-market') || '';
+      const currentPriceVal = parseFloat(container.getAttribute('data-price') || '0');
+      
+      if (!propId) return;
+      
+      if (historicalCacheRef.current[propId]) {
+        renderSparkline(container, historicalCacheRef.current[propId], currentPriceVal, mkt, lang);
+        return;
+      }
+      
+      try {
+        const trend = await fetchTrendFromAI(dist, cty, mkt, currentPriceVal, propId);
+        historicalCacheRef.current[propId] = trend;
+        renderSparkline(container, trend, currentPriceVal, mkt, lang);
+      } catch (err) {
+        console.warn("AI sparkline trend fetch failed, using fallback:", err);
+        const fallbackTrend = generateFallbackTrend(propId, currentPriceVal);
+        historicalCacheRef.current[propId] = fallbackTrend;
+        renderSparkline(container, fallbackTrend, currentPriceVal, mkt, lang);
+      }
+    };
+    
+    mapRef.current.on('popupopen', handlePopupOpen);
+    return () => {
+      mapRef.current?.off('popupopen', handlePopupOpen);
+    };
+  }, [lang, market, fluctuationTick]);
 
   // --- AUDIO CONTROL FUNCTIONS ---
   const stopBriefing = () => {
@@ -1111,7 +1300,7 @@ export default function App() {
 
   useEffect(() => {
     generateMarkers();
-  }, [market, city, district, lang, watchedProperties]);
+  }, [market, city, district, lang, watchedProperties, fluctuationTick]);
 
   useEffect(() => {
     let interval: any;
@@ -1164,35 +1353,79 @@ export default function App() {
       const type = randVal > 0.6 ? 'risk' : (randVal > 0.3 ? 'stable' : 'new');
       const color = type === 'risk' ? '#ef4444' : (type === 'stable' ? '#10b981' : '#3b82f6');
       const variance = 0.8 + (rng() * 0.4); 
-      let displayPrice = "";
+      let basePriceVal = 0;
       let displayRent = "";
 
       if (market === 'VN') {
-         const p = (basePriceUnit * variance * 60) / 1000;
-         displayPrice = `${p.toFixed(2)} Tỷ`;
+         basePriceVal = (basePriceUnit * variance * 60) / 1000;
          const r = baseRentUnit * variance;
          displayRent = `${r.toFixed(1)} Tr/th`;
       } else {
-         const p = basePriceUnit * variance * 60;
-         displayPrice = p > 100000 ? `${(p/1000).toFixed(0)}k €` : `${p.toFixed(0)} €`;
+         basePriceVal = basePriceUnit * variance * 60;
          const r = baseRentUnit * variance * 60;
          displayRent = `${r.toFixed(0)} €`;
+      }
+
+      // Smooth time-based periodic price fluctuation (+/- 5% max range)
+      // Different properties have different waves based on seed
+      const propSeedValue = seededRandom(`${district}-${city}-${i}`)();
+      const wavePhase = (Date.now() / 30000) + (propSeedValue * 2 * Math.PI);
+      const fluctuationMultiplier = 1.0 + (Math.sin(wavePhase) * 0.05);
+      const currentPriceVal = basePriceVal * fluctuationMultiplier;
+
+      let displayPrice = "";
+      if (market === 'VN') {
+         displayPrice = `${currentPriceVal.toFixed(2)} Tỷ`;
+      } else {
+         displayPrice = currentPriceVal > 100000 ? `${(currentPriceVal/1000).toFixed(0)}k €` : `${currentPriceVal.toFixed(0)} €`;
       }
 
       const statusText = type === 'risk' ? t.risk : (type === 'stable' ? t.stable : t.newPlanning);
       const statusColorClass = type === 'risk' ? 'text-red-500' : (type === 'stable' ? 'text-emerald-600' : 'text-blue-500');
 
       const propId = `${market}-${city}-${district}-${i}`;
-      const isWatched = watchedProperties.includes(propId);
+      const watchedItem = watchedProperties.find(p => p.id === propId);
+      const isWatched = !!watchedItem;
+
+      let priceChangeIndicator = "";
+      let savedPriceInfo = "";
+      let badgeHtml = "";
+
+      if (isWatched) {
+         badgeHtml += `<div style="position: absolute; top: -6px; right: -6px; background-color: #f59e0b; color: white; width: 12px; height: 12px; border-radius: 50%; border: 1px solid white; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 2px rgba(0,0,0,0.3); font-size: 8px; line-height: 1; font-weight: bold;">★</div>`;
+         
+         if (watchedItem && watchedItem.savedPrice > 0) {
+            const pctChange = ((currentPriceVal - watchedItem.savedPrice) / watchedItem.savedPrice) * 100;
+            // threshold of 0.1% to prevent noise
+            if (Math.abs(pctChange) > 0.1) {
+               const arrowColor = pctChange > 0 ? '#ef4444' : '#10b981';
+               const arrowChar = pctChange > 0 ? '▲' : '▼';
+               const sign = pctChange > 0 ? '+' : '';
+               priceChangeIndicator = `<span class="inline-flex items-center font-extrabold ml-1.5 text-[10px]" style="color: ${arrowColor};" title="Thay đổi so với giá lúc lưu"> ${arrowChar} ${sign}${pctChange.toFixed(1)}%</span>`;
+               badgeHtml += `<div style="position: absolute; bottom: -6px; left: -6px; background-color: ${arrowColor}; color: white; width: 12px; height: 12px; border-radius: 50%; border: 1px solid white; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 2px rgba(0,0,0,0.3); font-size: 8px; line-height: 1; font-weight: bold;">${arrowChar}</div>`;
+            }
+
+            let displaySavedPrice = "";
+            if (market === 'VN') {
+               displaySavedPrice = `${watchedItem.savedPrice.toFixed(2)} Tỷ`;
+            } else {
+               displaySavedPrice = watchedItem.savedPrice > 100000 ? `${(watchedItem.savedPrice/1000).toFixed(0)}k €` : `${watchedItem.savedPrice.toFixed(0)} €`;
+            }
+            const labelSaved = lang === 'VN' ? 'Lưu lúc:' : (lang === 'DE' ? 'Gemerkt bei:' : 'Saved at:');
+            savedPriceInfo = `
+              <div class="text-[9px] text-slate-400 font-semibold mb-1 -mt-1 italic">
+                 ${labelSaved} ${displaySavedPrice}
+              </div>
+            `;
+         }
+      }
 
       const icon = L.divIcon({
         className: 'custom-div-icon',
-        html: isWatched 
-          ? `<div style="position: relative; cursor: pointer;">
-               <div style="background-color: ${color}; width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2);"></div>
-               <div style="position: absolute; top: -6px; right: -6px; background-color: #f59e0b; color: white; width: 12px; height: 12px; border-radius: 50%; border: 1px solid white; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 2px rgba(0,0,0,0.3); font-size: 8px; line-height: 1; font-weight: bold;">★</div>
-             </div>`
-          : `<div style="background-color: ${color}; width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer;"></div>`,
+        html: `<div style="position: relative; width: 14px; height: 14px; overflow: visible; cursor: pointer;">
+                 <div style="background-color: ${color}; width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2);"></div>
+                 ${badgeHtml}
+               </div>`,
         iconSize: [14, 14], iconAnchor: [7, 7]
       });
       const marker = L.marker([basePos[0] + latOffset, basePos[1] + lngOffset], { icon });
@@ -1202,19 +1435,34 @@ export default function App() {
       const btnTextColor = isWatched ? 'text-white' : 'text-slate-700';
 
       const popupContent = `
-        <div class="font-sans text-slate-800 min-w-[140px]">
+        <div class="font-sans text-slate-800 min-w-[150px]">
           <div class="text-[10px] font-black uppercase tracking-widest mb-2 ${statusColorClass}">
-             ${statusText}
+              ${statusText}
           </div>
           <div class="flex justify-between items-center text-xs mb-1 border-b border-slate-100 pb-1">
-             <span class="text-slate-400 font-medium">Giá:</span>
-             <span class="font-bold">${displayPrice}</span>
+             <span class="text-slate-400 font-medium">${lang === 'VN' ? 'Giá:' : (lang === 'DE' ? 'Preis:' : 'Price:')}</span>
+             <span class="font-bold flex items-center">
+                ${displayPrice}
+                ${priceChangeIndicator}
+             </span>
           </div>
+          ${savedPriceInfo}
           <div class="flex justify-between items-center text-xs mb-2">
-             <span class="text-slate-400 font-medium">Thuê:</span>
+             <span class="text-slate-400 font-medium">${lang === 'VN' ? 'Thuê:' : (lang === 'DE' ? 'Miete:' : 'Rent:')}</span>
              <span class="font-bold">${displayRent}</span>
           </div>
-          <button class="watch-prop-btn w-full py-1.5 px-2 rounded-lg text-[10px] font-bold text-center ${btnBg} ${btnTextColor} flex items-center justify-center gap-1 transition-all" data-prop-id="${propId}">
+
+          <div class="mt-2 pt-2 border-t border-slate-100 mb-2">
+            <div class="text-[8px] font-black text-slate-400 uppercase tracking-wider mb-1 flex justify-between items-center">
+               <span>${lang === 'VN' ? 'Xu hướng 12T' : (lang === 'DE' ? '12M Trend' : '12M Trend')}</span>
+               <span class="text-[7px] font-semibold text-emerald-600 bg-emerald-50 px-1 py-0.5 rounded">AI Analytics</span>
+            </div>
+            <div id="sparkline-container-${propId}" class="sparkline-container w-full h-[32px] bg-slate-50/50 rounded-lg flex items-center justify-center border border-slate-100 overflow-hidden relative" data-prop-id="${propId}" data-district="${district}" data-city="${city}" data-market="${market}" data-price="${currentPriceVal}">
+               <span class="text-[8px] text-slate-400 animate-pulse font-medium">${lang === 'VN' ? 'Đang tải...' : (lang === 'DE' ? 'Lade...' : 'Loading...')}</span>
+            </div>
+          </div>
+
+          <button class="watch-prop-btn w-full py-1.5 px-2 rounded-lg text-[10px] font-bold text-center ${btnBg} ${btnTextColor} flex items-center justify-center gap-1 transition-all" data-prop-id="${propId}" data-current-price="${currentPriceVal}">
              ${btnText}
           </button>
         </div>

@@ -1,0 +1,13 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "bds-navigator"
+compatibility_date = "2026-07-04"
+
+[site]
+bucket = "./dist"
+
+# Configuration for Cloudflare Pages
+[pages]
+# Directory containing static assets to deploy
+directory = "./dist"
+# Command to build the application
+build_command = "npm run build"
